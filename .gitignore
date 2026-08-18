@@ -1,0 +1,43 @@
+# ===== 비밀 정보 (절대 커밋 금지) =====
+.env
+*.key
+*.pem
+
+# ===== 원본 문서 (용량 문제로 저장소 제외) =====
+docs/
+funds/
+
+# ===== 중간/최종 산출물 (build 스크립트로 재생성) =====
+data/
+processed/
+product_profiles.json
+product_sections.json
+*.sqlite
+*.sqlite3
+*.db
+
+# ===== 임베딩 캐시 =====
+**/vector_db/
+rag_embeddings*.json
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ===== 에디터 / OS =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 임시 =====
+_to_delete/
+*.log
+tmp/

@@ -1,0 +1,78 @@
+[
+    {
+        "question_id": "Q-001",
+        "difficulty": "하",
+        "category": "세제",
+        "question": "연금저축이랑 IRP 다 합쳐서 세액공제 얼마까지 되나요?",
+        "expected_keywords": [
+            "900만원",
+            "세액공제",
+            "연금저축",
+            "IRP"
+        ],
+        "expected_engine": "SQLite"
+    },
+    {
+        "question_id": "Q-002",
+        "difficulty": "중",
+        "category": "과세/세율",
+        "question": "만 72세에 연금 수령하면 세율 몇 % 적용돼요?",
+        "expected_keywords": [
+            "3.3%",
+            "70세 이상",
+            "80세 미만",
+            "연금소득세"
+        ],
+        "expected_engine": "SQLite"
+    },
+    {
+        "question_id": "Q-003",
+        "difficulty": "중",
+        "category": "상품 필터링",
+        "question": "위험등급 3등급 이하이고 총보수 0.5% 이하인 펀드 목록 줘",
+        "expected_keywords": [
+            "위험등급 3등급",
+            "총보수 0.5%",
+            "펀드 목록"
+        ],
+        "expected_engine": "SQLite"
+    },
+    {
+        "question_id": "Q-004",
+        "difficulty": "중",
+        "category": "법적 권리/압류",
+        "question": "임원 퇴직금이나 DC 추가납입금도 압류가 금지되나요?",
+        "expected_keywords": [
+            "압류 금지",
+            "퇴직금",
+            "DC 추가납입금"
+        ],
+        "expected_engine": "SQLite"
+    },
+    {
+        "question_id": "Q-005",
+        "difficulty": "하",
+        "category": "제도 비교",
+        "question": "DC, DB, 퇴직금 정해지는 방식과 운용 주체 차이는?",
+        "expected_keywords": [
+            "DC형",
+            "DB형",
+            "운용 주체",
+            "급여 지급 방식"
+        ],
+        "expected_engine": "Vector DB"
+    },
+    {
+        "question_id": "Q-006",
+        "difficulty": "상",
+        "category": "절세/복합 상담",
+        "question": "명퇴하는 교사인데 명퇴수당 연금계좌 넣으면 절세되나요?",
+        "expected_keywords": [
+            "명예퇴직수당",
+            "연금계좌",
+            "세제혜택",
+            "과세이연"
+        ],
+        "expected_engine": "하이브리드"
+    }
+]
