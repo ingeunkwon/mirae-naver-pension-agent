@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 from pathlib import Path
 import requests
@@ -8,18 +9,35 @@ BASE_DIR = Path(__file__).resolve().parent
 
 FIN_SCHEMA = """
 [financial_data.sqlite - 연금 제도/세제 정형 데이터]
-1. pension_tax_limits (income_tier TEXT, deduction_rate REAL, pension_limit INTEGER,
-     isa_additional_limit INTEGER, total_max_deposit INTEGER, total_max_benefit INTEGER)
-   -- 소득 구간별 세액공제 한도. 금액 단위는 원.
-2. pension_age_tax_rates (age_category TEXT, min_age INTEGER, max_age INTEGER,
-     tax_rate REAL, tax_type TEXT)
-   -- 연령대별 연금소득세율. 55~69세 5.5% / 70~79세 4.4% / 80세 이상 3.3%
-3. pension_seizure_rules (asset_type TEXT, is_seizable TEXT, seizure_ratio REAL, legal_basis TEXT)
-4. pension_withdrawal_rules (reason TEXT, is_statutory_allowed INTEGER,
-     is_tax_exempt_reason INTEGER, tax_rate_label TEXT, tax_rate REAL)
-5. document_tables (record_id TEXT, document TEXT, file_name TEXT, page INTEGER,
-     table_title TEXT, table_text TEXT)
-   -- 안내문에서 추출한 표 원문. 위 4개 표로 답할 수 없을 때 LIKE 검색에 사용.
+
+1. pension_tax_limits  -- 소득 구간별 연금계좌 세액공제. 금액 단위는 원.
+   income_tier          소득 구간 (총급여 5,500만원 이하 / 초과)
+   deduction_rate       공제율. 0.165 = 16.5%, 0.132 = 13.2%
+   pension_limit        ★세액공제 대상 납입한도 (연금저축+IRP 합산). 9,000,000
+   isa_additional_limit ISA 만기자금 전환 시 추가 한도. 3,000,000
+   total_max_deposit    pension_limit + isa_additional_limit 합계. 12,000,000
+   total_max_benefit    최대 환급 세액 = pension_limit x deduction_rate
+
+   ※ 컬럼 선택 주의
+     "세액공제 얼마까지 되나요" 는 pension_limit 이 답이다. total_max_deposit
+     (ISA 전환분까지 더한 총 납입한도)를 쓰면 틀린 답이 된다.
+     세액공제 질문에는 income_tier, deduction_rate, pension_limit,
+     total_max_benefit 을 함께 조회해 소득 구간별로 비교할 수 있게 한다.
+
+2. pension_age_tax_rates  -- 연령대별 연금소득세율
+   age_category, min_age, max_age, tax_rate, tax_type
+   55~69세 5.5% / 70~79세 4.4% / 80세 이상 3.3%
+   특정 나이를 물으면 min_age <= 나이 AND 나이 <= max_age 로 조회한다.
+
+3. pension_seizure_rules   -- 자산 유형별 압류 가능 여부
+   asset_type, is_seizable, seizure_ratio, legal_basis
+
+4. pension_withdrawal_rules -- 중도인출 사유별 허용 여부와 과세율
+   reason, is_statutory_allowed, is_tax_exempt_reason, tax_rate_label, tax_rate
+
+5. document_tables  -- 안내문에서 추출한 표 원문
+   record_id, document, file_name, page, table_title, table_text
+   위 4개 표로 답할 수 없을 때 table_text LIKE 검색에 사용한다.
 """
 
 FUND_SCHEMA = """
@@ -68,6 +86,66 @@ FUND_SCHEMA = """
 """
 
 
+def _extract_sql(content):
+    """모델 응답에서 SELECT 문을 최대한 살려서 뽑아낸다.
+
+    모델이 JSON 뒤에 설명을 덧붙이면 json.loads 가 'Extra data' 로 실패하고,
+    그러면 DB 조회 결과가 통째로 비어 LLM 이 일반 상식으로 답을 메운다.
+    실제로 공식 예시 질의(솔로몬 국공채 비교)가 이 경로로 무너졌다.
+    """
+    if not content:
+        return None
+    c = content.strip()
+    if c.startswith("```"):
+        c = re.sub(r'^```[a-zA-Z]*\s*', '', c)
+        c = re.sub(r'```\s*$', '', c).strip()
+
+    # 1) 정상 JSON
+    try:
+        v = json.loads(c)
+        if isinstance(v, dict) and v.get("sql"):
+            return v["sql"]
+    except Exception:
+        pass
+    # 2) 앞쪽 JSON 객체만 잘라서 재시도 (뒤에 설명이 붙은 경우)
+    depth, start = 0, None
+    for i, ch in enumerate(c):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    v = json.loads(c[start:i + 1])
+                    if isinstance(v, dict) and v.get("sql"):
+                        return v["sql"]
+                except Exception:
+                    pass
+                break
+    # 3) sql 값만 정규식으로
+    m = re.search(r'"sql"\s*:\s*"((?:[^"\\]|\\.)*)"', c, re.S)
+    if m:
+        return m.group(1).replace('\\"', '"').replace('\\n', ' ').replace('\\\\', '\\')
+    # 4) 맨몸 SELECT 문
+    m = re.search(r'(SELECT\b[\s\S]*?)(?:;|\n\s*\n|$)', c, re.I)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _clean_sql(sql):
+    """주석/설명이 섞여 들어온 SQL 을 정리한다."""
+    if not sql:
+        return None
+    sql = re.sub(r'--[^\n]*', ' ', sql)          # 라인 주석
+    sql = re.sub(r'/\*[\s\S]*?\*/', ' ', sql)   # 블록 주석
+    sql = re.sub(r'\s+', ' ', sql).strip().rstrip(';').strip()
+    m = re.search(r'\bSELECT\b[\s\S]*', sql, re.I)
+    return m.group(0).strip() if m else None
+
+
 class PensionSQLAgent:
     def __init__(
         self,
@@ -87,6 +165,13 @@ class PensionSQLAgent:
 
 [작성 규칙]
 - SELECT 문 하나만 작성한다. 수정/삭제 구문은 절대 쓰지 않는다.
+- 상품명 검색은 반드시 키워드를 쪼개 AND LIKE 로 연결한다. 정식 상품명에는
+  운용사명과 수식어가 끼어 있어 연속 문자열로는 매칭되지 않는다.
+    (X) WHERE product_name LIKE '%솔로몬 국공채%'
+    (O) WHERE product_name LIKE '%솔로몬%' AND product_name LIKE '%국공채%'
+- 상품 비교/추천 질의는 fund_products 만 조회하지 말고 반드시
+  fund_class_fees(총보수)를 조인하고, 가능하면 fund_performance(수익률)도 함께 가져온다.
+  총보수 없이 상품을 비교하면 답변이 성립하지 않는다.
 - 결과가 너무 많아지지 않도록 필요하면 LIMIT 20 을 붙인다.
 - 상품 비교 질의는 사람이 읽을 수 있도록 product_name 을 반드시 포함한다.
 
@@ -108,9 +193,10 @@ class PensionSQLAgent:
             content = res.get("result", {}).get("message", {}).get("content", "").strip()
             if content.startswith("```"):
                 content = content.replace("```json", "").replace("```", "").strip()
-            sql = json.loads(content).get("sql")
-            if not sql or not sql.strip().lower().startswith("select"):
-                return {"error": "SELECT 문이 아님", "sql": sql, "columns": [], "data": []}
+            sql = _clean_sql(_extract_sql(content))
+            if not sql or not sql.lower().startswith("select"):
+                return {"error": "SELECT 문을 추출하지 못함", "sql": sql,
+                        "raw": content[:300], "columns": [], "data": []}
 
             conn = sqlite3.connect(db_path)
             cur = conn.cursor()
