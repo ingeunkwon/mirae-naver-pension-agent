@@ -22,6 +22,34 @@ BASE_DIR = Path(__file__).resolve().parent
 # 실행마다 HYBRID/RAG 로 갈려서 결과가 달라졌다. 코드 패턴을 직접 잡는다.
 CLASS_CODE_RE = re.compile(r"[CSA]-(?:P2?|R)[A-Z0-9]*", re.I)
 
+# ------------------------------------------------------------- safety_check
+# 팀원(Kwonjunil/mirae_asset_competiton) 저장소 orchestrator.py에서 그대로
+# 가져왔다 — LLM 호출 전에 정규식으로 PII·프롬프트 인젝션을 코드가 막는다.
+# 프롬프트 지시문에만 맡기면 "이전 지시를 무시해" 같은 문구가 시스템 프롬프트
+# 안으로 그대로 들어가 우회당할 수 있다.
+# 주의: \b는 한글 앞뒤에서 경계가 안 잡힌다. "900101-1234567인데"의 '7'과
+# '인' 사이에는 \b가 없어서 그냥 쓰면 통과한다 — (?<!\d)/(?!\d)로 대체한다.
+_PII = [
+    ("주민등록번호", re.compile(r"(?<!\d)\d{6}\s*[-–]\s*[1-4]\d{6}(?!\d)")),
+    ("카드번호",     re.compile(r"(?<!\d)(?:\d{4}[-\s]?){3}\d{4}(?!\d)")),
+    ("계좌번호",     re.compile(r"(?<!\d)\d{2,3}-\d{2,6}-\d{4,8}(?!\d)")),
+    ("여권번호",     re.compile(r"(?<![A-Za-z0-9])[MSRO]\d{8}(?!\d)")),
+]
+_INJECTION = re.compile(
+    r"(이전|위)\s*(의)?\s*지시(를|는)?\s*(무시|잊)|"
+    r"너는\s*이제부터|당신은\s*이제부터|"
+    r"system\s*prompt|프롬프트를?\s*(알려|출력|보여)|"
+    r"ignore\s+(all\s+)?(previous|above)\s+instructions|"
+    r"규칙을?\s*무시", re.I)
+
+SAFETY_MESSAGE = (
+    "죄송합니다. 주민등록번호·계좌번호 등 개인정보가 포함된 질문에는 답변드릴 수 "
+    "없습니다. 개인정보를 빼고 제도 내용만 질문해 주시면 답변드리겠습니다.")
+INJECTION_MESSAGE = (
+    "죄송합니다. 요청하신 내용은 처리할 수 없습니다. 퇴직연금·연금저축 제도에 "
+    "대해 궁금하신 점을 질문해 주세요.")
+
+
 class PensionOrchestrator:
     def __init__(self):
         # 제도 트랙: 팀원 이식본. HCX 호출 0회로 조회하는 SQL과, BM25+벡터
@@ -38,6 +66,16 @@ class PensionOrchestrator:
             fin_db_path=BASE_DIR / "data" / "financial_data.sqlite",
             fund_db_path=BASE_DIR / "data" / "fund_prospectus_v2.sqlite"
         )
+
+    @staticmethod
+    def safety_check(question: str) -> str | None:
+        """LLM에 닿기 전에 코드가 막는다. None이면 통과."""
+        for label, pat in _PII:
+            if pat.search(question):
+                return f"PII:{label}"
+        if _INJECTION.search(question):
+            return "INJECTION"
+        return None
 
     # 라우팅은 규칙으로 먼저 판정하고, 애매할 때만 LLM 을 부른다.
     # LLM 단독 라우팅은 "총보수 0.5% 이하 펀드" 같은 명백한 상품 질의도 놓쳤고,
@@ -241,8 +279,19 @@ class PensionOrchestrator:
         return res.get("result", {}).get("message", {}).get("content", "").strip()
 
     def process(self, query: str) -> dict:
+        # --- 0. safety_check — PII/인젝션이면 LLM을 아예 호출하지 않는다.
+        flag = self.safety_check(query)
+        if flag:
+            msg = SAFETY_MESSAGE if flag.startswith("PII") else INJECTION_MESSAGE
+            return {
+                "answer": msg,
+                "think_trace": f"0. safety_check: 차단({flag}) — LLM 호출 없음",
+                "retrieved_context": "",
+                "sources": [],
+            }
+
         route = self.route_query(query)
-        think_trace_list = [f"1. 의도 분류 및 라우팅: {route}"]
+        think_trace_list = [f"0. safety_check: 통과", f"1. 의도 분류 및 라우팅: {route}"]
         
         rag_context = ""
         sql_context = ""
