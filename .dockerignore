@@ -1,0 +1,66 @@
+# 시크릿 — 이미지에 절대 포함하지 않는다. 런타임에 볼륨/환경변수로 주입.
+.env
+
+# 재생성 가능/용량 큰 산출물 — data/ 는 볼륨 마운트로 채운다
+data/
+processed/
+product_profiles.json
+product_sections.json
+product_profiles_v2.json
+product_sections_v2.json
+*.sqlite
+*.sqlite3
+*.db
+.cache_pdftext/
+.cache_embed.json
+
+# 원본 문서 (용량 문제 + 대회 공유 제한)
+docs/
+docs_renamed/
+funds/
+투자설명서/
+투자설명서/
+오프라인 설명회 사진 순서대로.pdf
+(배포용)과제소개자료_연금Agent.pdf
+과제 설명.txt
+연금 기초 환경설정.txt
+ai 학습 아키텍처.txt
+junil data/
+
+# 평가/진단 스크립트 산출물 — 이미지 실행에 불필요
+eval_reports/
+result_*.json
+v1_console.txt
+v2_console.txt
+hallu*.json
+hallu*_summary.txt
+calibrate_result.json
+diag_*.json
+validate_facts_result.json
+
+# 코드 수정 전 백업 스냅샷 / 중복 인코딩 파일
+*.bak_20260820*
+*.b64
+
+# 개발 환경 잔재
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+_to_delete/
+*.log
+tmp/
+
+# 버전 관리 메타데이터
+.git/
+.gitignore
+.gitattributes
