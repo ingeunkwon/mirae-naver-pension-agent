@@ -29,6 +29,13 @@ HCX_URL = "https://clovastudio.stream.ntruss.com/v3/chat-completions/HCX-007"
 TIMEOUT = 90
 HYBRID_TOP_K = 10
 
+# 코퍼스에 없는 질문인데도 hybrid_search 는 항상 top_k 개를 돌려준다.
+# 관련성 임계값이 없으면 무관한 청크가 근거로 올라가고, 생성 모델이 그 위에
+# 이야기를 만든다(평가 v2 환각 점검 1/4, V-10/V-21/V-26).
+# 상위 문서의 코사인 유사도가 이 값 미만이면 생성을 건너뛰고 한계를 고지한다.
+#   0.0 = 비활성(기본). calibrate_threshold.py 로 분포를 재고 값을 정한 뒤 켠다.
+MIN_TOP_SCORE = float(os.getenv("RAG_MIN_TOP_SCORE", "0.0"))
+
 PENSION_TYPE_BONUS = 0.08
 PRIMARY_TOPIC_BONUS = 0.06
 ASPECT_BONUS = 0.05
@@ -43,6 +50,32 @@ def build_headers():
         "X-NCP-CLOVASTUDIO-REQUEST-ID": str(uuid.uuid4()),
         "Content-Type": "application/json",
     }
+
+
+# CLOVA 가 429(호출 한도)나 5xx 를 한 번 뱉으면 그 문항이 통째로 0점이 된다.
+# 평가는 40~66문항을 연속으로 던지므로 한 번은 반드시 만난다고 봐야 한다.
+# 지수 백오프로 재시도하고, 그래도 안 되면 마지막 응답을 그대로 돌려준다
+# (호출부가 status_code 로 판단하도록 예외를 삼키지 않는다).
+RETRY_STATUS = {408, 429, 500, 502, 503, 504}
+
+
+def post_with_retry(url, payload, timeout=TIMEOUT, tries=3, backoff=2.0):
+    import time as _time
+    last = None
+    for attempt in range(tries):
+        try:
+            last = requests.post(url, headers=build_headers(),
+                                 json=payload, timeout=timeout)
+            if last.status_code not in RETRY_STATUS:
+                return last
+        except requests.RequestException as e:
+            last = None
+            err = e
+        if attempt < tries - 1:
+            _time.sleep(backoff * (2 ** attempt))
+    if last is None:
+        raise RuntimeError(f"CLOVA 호출 실패({tries}회 재시도): {err}")
+    return last
 
 def detect_query_metadata(query):
     """질의에서 연금 유형/주제/속성 태그를 추출한다.
@@ -132,12 +165,7 @@ def detect_query_metadata(query):
 
 
 def embed_query(text):
-    response = requests.post(
-        EMBEDDING_URL,
-        headers=build_headers(),
-        json={"text": text},
-        timeout=TIMEOUT,
-    )
+    response = post_with_retry(EMBEDDING_URL, {"text": text})
     if response.status_code != 200:
         raise RuntimeError(f"Embedding 오류 {response.status_code}: {response.text[:500]}")
     
@@ -209,11 +237,9 @@ def rerank(query, results):
             continue
         documents.append({"id": record["chunk_id"], "doc": text})
 
-    response = requests.post(
+    response = post_with_retry(
         RERANKER_URL,
-        headers=build_headers(),
-        json={"query": query, "documents": documents, "maxTokens": 500},
-        timeout=TIMEOUT,
+        {"query": query, "documents": documents, "maxTokens": 500},
     )
     if response.status_code != 200:
         raise RuntimeError(f"Reranker 오류 {response.status_code}: {response.text[:1000]}")
@@ -318,6 +344,13 @@ def generate_answer(query, context):
 따라서 확인이 필요한 조건이 있으면 그 확인 질문을 첫 답변 안에 포함하고,
 동시에 조건별 결론까지 한 번에 제시한다.
 
+[우선순위 - 아래 두 규칙이 충돌하면 이 규칙이 이긴다]
+근거가 질문의 주제를 아예 다루지 않으면(코퍼스에 없는 질문), "확인 필요 조건 ->
+조건별 결론" 구성을 적용하지 않는다. 그 경우엔 "근거가 주제를 안 다루면 만들지
+않는다" 규칙만 따라 "제공된 자료에서는 OO에 대한 내용을 확인하지 못했습니다."
+로 짧게 답한다. 조건 하나가 빠진 것(예: 계좌 종류 미기재)과 근거 자체가 없는
+것(질문 주제를 다루는 근거가 전혀 없음)을 구분해서 판단한다.
+
 [답변 구성 - 이 순서를 지킨다]
 1) 확인 필요 조건
    질의에 조건(계좌 종류, 소득 구간, 연령, 투자기간, 감내 위험 등)이 빠져 있으면
@@ -331,6 +364,29 @@ def generate_answer(query, context):
    어느 근거에서 나온 수치인지 문장 안에서 드러나게 쓴다.
 4) 다음 행동
    사용자가 이어서 확인하거나 결정할 일을 한 줄로 제시한다.
+
+[규칙 - 수치와 조건은 절대 요약하지 않는다]  ★ 가장 중요
+근거에 수치나 조건이 여러 개 나열되어 있거나 경우에 따라 다르게 제시되어 있으면,
+임의로 하나만 고르거나 뭉뚱그리지 말고 전부 다 적는다.
+아래 항목은 하나도 빠뜨리지 않는다.
+  - 금액.비율.세율   (900만원, 1,800만원, 16.5%, 13.2%, 4.4% ...)
+  - 기한.기간        (60일 이내, 6개월 이상, 14일 이내, 6주, 5년 경과 ...)
+  - 조건.자격        (무주택자, 만 55세 이상, 계속근로기간 1년 이상, 주 15시간 ...)
+  - 절차.방법        (내점 신청, 신청서 제출, 근로자대표 동의, 고용노동부 신고 ...)
+  - 예외.단서        ("단, ~인 경우는 제외" 같은 문구)
+요약하느라 이 항목을 생략하면 답변이 틀린 것으로 간주된다.
+근거에 두 가지 경우가 나오면 둘 다 쓴다. 길이 제한은 없다.
+
+[규칙 - 근거가 주제를 안 다루면 만들지 않는다]
+검색 근거가 질문의 주제를 직접 다루지 않으면 아는 것처럼 답을 구성하지 않는다.
+  1. 근거에 없는 절차.기한.연락처.URL.기관명.법령 조문을 만들어내지 않는다.
+  2. 실제로 그 내용을 담고 있지 않은 근거 번호를 인용하지 않는다.
+     [근거 N] 을 쓸 때는 그 근거에 해당 문장이 실제로 있어야 한다.
+  3. "일반적으로", "대부분의 기관에서는", "통상" 으로 시작하는 일반론으로
+     근거의 빈자리를 메우지 않는다.
+근거가 주제를 다루지 않으면 이렇게만 답한다.
+  "제공된 자료에서는 OO에 대한 내용을 확인하지 못했습니다."
+  그 뒤에 확인 가능한 인접 정보가 있으면 그것만 덧붙인다.
 
 [원칙]
 - 질문에 사실과 다른 전제가 섞여 있으면 먼저 바로잡고 답한다.
@@ -369,6 +425,12 @@ def generate_answer(query, context):
 clarifications 와 assumptions 는 해당 사항이 없으면 빈 배열로 둔다.
 
 [출력 형식 주의]
+용어나 수치 중간에 ** 를 넣지 않는다. 강조는 항목 이름이나 줄머리에만 쓴다.
+용어와 조사 사이에 ** 가 끼면 문자열이 끊어져 채점.검색에서 불이익이 있다.
+  (X) 자금을 **금융기관**에 적립하고      (O) 자금을 금융기관에 적립하고
+  (X) 이전하는 것은 **불가능**합니다      (O) 이전하는 것은 불가능합니다
+  (X) 세액공제율은 **13.2%**입니다        (O) 세액공제율은 13.2% 입니다
+
 answer 값 안에서 LaTeX 표기를 쓰지 않는다. 백슬래시가 JSON 을 깨뜨린다.
 곱셈은 x, 퍼센트는 % 로 그대로 쓴다.
   (X) \\(900만원 \\times 16.5\\% = 148만5천원\\)
@@ -386,7 +448,7 @@ answer 값 안에서 LaTeX 표기를 쓰지 않는다. 백슬래시가 JSON 을 
         "maxCompletionTokens": 1500,
     }
 
-    response = requests.post(HCX_URL, headers=build_headers(), json=payload, timeout=TIMEOUT)
+    response = post_with_retry(HCX_URL, payload)
     if response.status_code != 200:
         raise RuntimeError(f"HCX 오류 {response.status_code}: {response.text[:1000]}")
 
@@ -417,6 +479,21 @@ class PensionRAGAgent:
 
     def ask(self, query, generate=True):
         hybrid_results = hybrid_search(query, self.records, top_k=HYBRID_TOP_K)
+
+        # 상위 문서조차 유사도가 낮으면 코퍼스가 이 주제를 안 다루는 것이다.
+        # 리랭커·생성을 태우지 않고 여기서 끊는다(환각 방지 + 호출 절약).
+        top_score = hybrid_results[0]["vector_score"] if hybrid_results else 0.0
+        self.last_top_score = top_score
+        if MIN_TOP_SCORE > 0 and top_score < MIN_TOP_SCORE:
+            return {
+                "query": query, "answer": "",
+                "sources": [], "used_evidence": [],
+                "clarifications": [], "assumptions": [],
+                "raw_context": "",
+                "below_threshold": True,
+                "top_score": top_score,
+            }
+
         reranker_result = rerank(query, hybrid_results)
         context, evidence_map = build_context(reranker_result)
 

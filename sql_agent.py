@@ -3,7 +3,7 @@ import re
 import sqlite3
 from pathlib import Path
 import requests
-from rag_agent import build_headers, TIMEOUT, HCX_URL
+from rag_agent import build_headers, post_with_retry, TIMEOUT, HCX_URL
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -59,9 +59,25 @@ FUND_SCHEMA = """
      mgmt_fee REAL, sales_fee REAL, trust_fee REAL, admin_fee REAL,
      total_fee REAL, etc_cost REAL, total_cost REAL)
    -- 판매 클래스별 보수. 단위는 연 %. total_fee 가 총보수(TER).
-      class_name 예: A(수수료선취-오프라인), A-E(온라인), C(수수료미징구-오프라인),
-      C-P(개인연금), C-PE(온라인 개인연금), C-P2/C-R(퇴직연금), S(온라인슈퍼)
-      연금계좌 질문이면 C-P / C-PE / C-P2 / C-R 계열을 우선 본다.
+
+   ★ 클래스 코드 해석 규칙 (class_desc 는 PDF 줄바꿈으로 문자열이 깨져 있으므로
+     절대 인용하지 말고, 아래 규칙으로 설명한다)
+       P  계열  (C-P, C-PE, S-P, C-P1 ...)        -> 연금저축(개인연금)
+       P2 계열  (C-P2, C-P2E, S-P2, C-P2I ...)    -> 퇴직연금
+       R  계열  (C-R, C-RJ, C-RF, C-RI ...)       -> 퇴직연금
+       코드 끝에 E 가 붙으면 온라인, 없으면 오프라인. S 로 시작하면 온라인슈퍼.
+       A = 수수료선취, C = 수수료미징구.
+     예) C-P  = 수수료미징구-오프라인-개인연금(연금저축)
+         C-PE = 수수료미징구-온라인-개인연금(연금저축)
+         C-P2 = 수수료미징구-오프라인-퇴직연금
+         C-P2E= 수수료미징구-온라인-퇴직연금
+
+   ★ 클래스 필터는 반드시 LIKE 로 쓴다. 정확히 일치(=)로 좁히면 변형 클래스를
+     통째로 놓친다. 실제로 'C-P2' 로만 좁혀 최저 보수 펀드를 놓친 사고가 있었다.
+       (X) WHERE class_name = 'C-P2'
+       (O) 퇴직연금:  WHERE (class_name LIKE '%P2%' OR class_name LIKE '%-R%')
+       (O) 연금저축:  WHERE (class_name LIKE '%-P%' AND class_name NOT LIKE '%P2%')
+       (O) 연금계좌 전체: WHERE (class_name LIKE '%-P%' OR class_name LIKE '%-R%')
 
 3. fund_performance (product_code TEXT, kind TEXT, class_name TEXT, period TEXT, value REAL)
    -- 연평균 수익률(%). kind: fund(펀드 전체) / class(클래스별) / benchmark(비교지수)
@@ -146,6 +162,127 @@ def _clean_sql(sql):
     return m.group(0).strip() if m else None
 
 
+# ──────────────────────────────────────────────────────────────────────
+# 실행 후 안전장치
+#
+# LLM 이 만든 SQL 의 ORDER BY 를 믿지 않는다. "가장 싼 게 뭔가요?" 질의에서
+# ORDER BY 가 빠지거나 클래스 필터가 좁아 최솟값을 놓친 사례가 실제로 있었다
+# (평가 Q-014: 0.155% 상품을 두고 0.26% 를 "가장 낮다"고 답함).
+# 숫자 컬럼이 있고 질의에 최저/최고 신호가 있으면 파이썬에서 다시 정렬한다.
+# ──────────────────────────────────────────────────────────────────────
+
+SORT_ASC_WORDS = ['가장 싼', '가장 낮은', '가장 저렴', '가장 적은', '제일 싼',
+                  '제일 낮은', '제일 저렴', '최저', '싼 순', '낮은 순', '저렴한 순']
+SORT_DESC_WORDS = ['가장 비싼', '가장 높은', '제일 비싼', '제일 높은',
+                   '최고', '비싼 순', '높은 순']
+FEE_COLS = ('total_fee', 'fee_total', 'total_cost')
+
+CLASS_RULES = [
+    ('P2', '퇴직연금'), ('-R', '퇴직연금'), ('-P', '연금저축(개인연금)'),
+]
+
+# ──────────────────────────────────────────────────────────────────────
+# class_name 좁은 필터 안전장치
+#
+# 프롬프트에 "LIKE 로 넓게 써라"를 명시해도 LLM 이 여전히
+# WHERE class_name = 'C-P2' 식으로 정확히 일치시켜 C-P2E·S-P2·C-RJ 같은
+# 변형 클래스를 통째로 놓치는 사고가 실제로 재현됐다(평가 Q-014/Q-017).
+# ORDER BY 안전장치와 같은 이유로, LLM 이 만든 WHERE 절도 신뢰하지 않고
+# 코드에서 강제로 넓힌다.
+# ──────────────────────────────────────────────────────────────────────
+
+#   테이블 별칭이 붙은 경우(예: "fc.class_name = 'C-P'")까지 정규식이
+#   함께 소비해야 한다. 별칭 접두사를 남겨두고 값만 바꾸면
+#   "fc.(class_name LIKE ...)" 같은 깨진 SQL이 되어 unrecognized token
+#   에러가 난다(평가 Q-017에서 실제로 재현됨). class_name 앞에 붙는
+#   "별칭." 도 매치에 포함시켜 통째로 바꿔치기한다.
+_CLASS_EQ_RE = re.compile(r"(?:\w+\.)?class_name\s*=\s*'([A-Za-z0-9\-]+)'", re.I)
+_CLASS_IN_RE = re.compile(r"(?:\w+\.)?class_name\s+IN\s*\(\s*'([A-Za-z0-9\-]+)'[^)]*\)", re.I)
+# 질문에 클래스 코드가 직접 등장하면(예: "C-P2E 클래스 보수가 얼마?") LLM의
+# 좁은 필터가 의도된 것일 수 있으므로 넓히지 않는다. 넓히는 건 "가장 싼/이하"
+# 처럼 계좌유형 전체에서 비교·필터링하는 질문일 때만이다.
+_CLASS_CODE_IN_QUERY_RE = re.compile(r"[CSA]-(?:P2?|R)[A-Z0-9]*", re.I)
+
+
+def _broad_class_clause(code):
+    """좁은 class_name 값 하나를 계좌유형 전체를 포괄하는 LIKE 절로 바꾼다."""
+    c = (code or "").upper()
+    if 'P2' in c or c.startswith('C-R') or c.startswith('R') or '-R' in c:
+        return "(class_name LIKE '%P2%' OR class_name LIKE '%-R%')"
+    if '-P' in c or c.endswith('P'):
+        return "(class_name LIKE '%-P%' AND class_name NOT LIKE '%P2%')"
+    return None
+
+
+def _widen_class_filter(sql, query="", force=False):
+    """LLM 이 class_name 을 '='나 IN 으로 좁혀 썼으면 계좌유형 전체를
+    포괄하는 LIKE 절로 바꿔치기한다. (Q-014: 0.155%인 NH-Amundi를 두고
+    'C-P2'로만 좁혀 0.26%짜리를 '가장 낮다'고 답한 사고)
+    질문 자체가 특정 클래스 코드를 콕 집어 물었으면 기본적으로 건드리지
+    않지만, force=True 면 그마저도 무시하고 넓힌다 — 좁은 매칭이 0건일 때
+    재시도용으로 쓴다(Q-039: 'C-P'/'C-P2' 정확matching이 실제 저장값과
+    안 맞아 헛스윙한 경우)."""
+    if not sql or 'class_name' not in sql.lower():
+        return sql
+    if not force and _CLASS_CODE_IN_QUERY_RE.search(query or ""):
+        return sql
+
+    def _repl(m):
+        broad = _broad_class_clause(m.group(1))
+        return broad if broad else m.group(0)
+
+    sql = _CLASS_EQ_RE.sub(_repl, sql)
+    sql = _CLASS_IN_RE.sub(_repl, sql)
+    return sql
+
+
+def describe_class(code):
+    """class_desc 가 깨져 있으므로 class_name 코드에서 의미를 유도한다."""
+    if not code:
+        return None
+    c = str(code).upper().replace(' ', '')
+    account = None
+    if 'P2' in c:
+        account = '퇴직연금'
+    elif c.startswith('C-R') or c.startswith('R') or '-R' in c:
+        account = '퇴직연금'
+    elif '-P' in c or c.endswith('P'):
+        account = '연금저축(개인연금)'
+    if account is None:
+        return None
+    if c.startswith('S'):
+        channel = '온라인슈퍼'
+    elif c.endswith('E'):
+        channel = '온라인'
+    else:
+        channel = '오프라인'
+    fee = '수수료선취' if c.startswith('A') else '수수료미징구'
+    return f"{fee}-{channel}-{account}"
+
+
+def _postprocess(query, cols, rows):
+    """최저/최고 질의는 재정렬하고, class_name 이 있으면 의미 컬럼을 덧붙인다."""
+    if not rows or not cols:
+        return cols, rows
+    rows = [list(r) for r in rows]
+
+    fee_idx = next((cols.index(c) for c in FEE_COLS if c in cols), None)
+    if fee_idx is not None:
+        q = query.lower()
+        if any(w in q for w in SORT_ASC_WORDS):
+            rows.sort(key=lambda r: (r[fee_idx] is None, r[fee_idx]))
+        elif any(w in q for w in SORT_DESC_WORDS):
+            rows.sort(key=lambda r: (r[fee_idx] is None,
+                                     -(r[fee_idx] if r[fee_idx] is not None else 0)))
+
+    if 'class_name' in cols and 'class_meaning' not in cols:
+        ci = cols.index('class_name')
+        cols = list(cols) + ['class_meaning']
+        for r in rows:
+            r.append(describe_class(r[ci]))
+    return cols, rows
+
+
 class PensionSQLAgent:
     def __init__(
         self,
@@ -172,8 +309,11 @@ class PensionSQLAgent:
 - 상품 비교/추천 질의는 fund_products 만 조회하지 말고 반드시
   fund_class_fees(총보수)를 조인하고, 가능하면 fund_performance(수익률)도 함께 가져온다.
   총보수 없이 상품을 비교하면 답변이 성립하지 않는다.
-- 결과가 너무 많아지지 않도록 필요하면 LIMIT 20 을 붙인다.
+- 목록을 요구하는 질의는 LIMIT 을 30 이상으로 둔다. 조건에 맞는 상품을 빠뜨리면
+  오답이 된다. 최소/최대 하나만 묻는 질의는 LIMIT 5 로 충분하다.
+- 최저/최고/가장 싼/가장 비싼 을 묻는 질의는 반드시 ORDER BY 를 넣는다.
 - 상품 비교 질의는 사람이 읽을 수 있도록 product_name 을 반드시 포함한다.
+- SELECT 에 class_name 과 total_fee 를 기본으로 포함한다.
 
 [질문]: {query}
 
@@ -189,21 +329,51 @@ class PensionSQLAgent:
         }
 
         try:
-            res = requests.post(HCX_URL, headers=build_headers(), json=payload, timeout=TIMEOUT).json()
+            res = post_with_retry(HCX_URL, payload).json()
             content = res.get("result", {}).get("message", {}).get("content", "").strip()
             if content.startswith("```"):
                 content = content.replace("```json", "").replace("```", "").strip()
-            sql = _clean_sql(_extract_sql(content))
-            if not sql or not sql.lower().startswith("select"):
-                return {"error": "SELECT 문을 추출하지 못함", "sql": sql,
+            raw_sql = _clean_sql(_extract_sql(content))
+            if not raw_sql or not raw_sql.lower().startswith("select"):
+                return {"error": "SELECT 문을 추출하지 못함", "sql": raw_sql,
                         "raw": content[:300], "columns": [], "data": []}
 
+            sql = _widen_class_filter(raw_sql, query)
+            cols, rows, sql_used, err = self._run(db_path, sql)
+            if err and sql != raw_sql:
+                # 넓히면서 SQL이 깨졌을 가능성에 대비해 원본으로 안전하게
+                # 재시도한다 — 넓힌 SQL 자체의 버그가 조회를 통째로
+                # 막아버리는 것보다는, 좁은 결과라도 내는 편이 낫다.
+                cols, rows, sql_used, err = self._run(db_path, raw_sql)
+            if err:
+                return {"error": err, "sql": sql_used, "columns": [], "data": []}
+
+            if not rows and sql_used == raw_sql and 'class_name' in raw_sql.lower():
+                # 질문에 클래스 코드가 있어 넓히지 않았는데 0건이면, 코드가
+                # 실제 저장 형식과 안 맞아 헛스윙했을 수 있다. 강제로 넓혀
+                # 한 번 더 시도한다(Q-039).
+                widened = _widen_class_filter(raw_sql, query, force=True)
+                if widened != raw_sql:
+                    cols2, rows2, sql2, err2 = self._run(db_path, widened)
+                    if not err2 and rows2:
+                        cols, rows, sql_used = cols2, rows2, sql2
+
+            cols, rows = _postprocess(query, cols, rows)
+            return {"sql": sql_used, "columns": cols, "data": rows}
+        except Exception as e:
+            return {"error": str(e), "sql": None, "columns": [], "data": []}
+
+    @staticmethod
+    def _run(db_path, sql):
+        """SQL 실행 헬퍼. 실패해도 예외를 던지지 않고 (cols, rows, sql, error)
+        로 돌려줘서 호출부가 재시도 여부를 판단할 수 있게 한다."""
+        try:
             conn = sqlite3.connect(db_path)
             cur = conn.cursor()
             cur.execute(sql)
             rows = cur.fetchall()
             cols = [d[0] for d in cur.description] if cur.description else []
             conn.close()
-            return {"sql": sql, "columns": cols, "data": rows}
+            return cols, rows, sql, None
         except Exception as e:
-            return {"error": str(e), "sql": None, "columns": [], "data": []}
+            return [], [], sql, str(e)

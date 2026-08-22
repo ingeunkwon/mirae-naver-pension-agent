@@ -1,16 +1,39 @@
 import json
+import re
 from pathlib import Path
 import requests
-from rag_agent import PensionRAGAgent, build_headers, TIMEOUT, HCX_URL
+from rag_agent import build_headers, post_with_retry, TIMEOUT, HCX_URL
+import pension_calc
 from sql_agent import PensionSQLAgent
+
+# 제도(퇴직연금·연금저축) 트랙 — 팀원(Kwonjunil/mirae_asset_competiton)의 구현을
+# 이식했다. Text-to-SQL 대신 결정적 슬롯 조회 + 3치(met/unmet/unknown) 조건
+# 판정을 쓰고, 검색은 벡터+메타보너스 대신 BM25+벡터 RRF 융합을 쓴다.
+# 상품(펀드) 트랙은 기존 sql_agent.PensionSQLAgent(Text-to-SQL)를 그대로 쓴다 —
+# 팀원 구현은 아직 상품 트랙이 없다.
+from institution_sql_agent import PensionSQLAgent as InstitutionSQLAgent
+from institution_rag_agent import PensionRAGAgent as InstitutionRAGAgent
+from institution_format import run_institution_sql, format_institution_rag_context
 
 BASE_DIR = Path(__file__).resolve().parent
 
+# 종류코드(C-P, C-P2, S-P2, C-RJ ...) 비교 질문은 '펀드' 같은 FUND_WORDS 가
+# 안 걸려 라우팅이 LLM 판단(비결정적)에 맡겨졌다. Q-039 가 같은 질문인데도
+# 실행마다 HYBRID/RAG 로 갈려서 결과가 달라졌다. 코드 패턴을 직접 잡는다.
+CLASS_CODE_RE = re.compile(r"[CSA]-(?:P2?|R)[A-Z0-9]*", re.I)
+
 class PensionOrchestrator:
     def __init__(self):
-        self.rag_agent = PensionRAGAgent(
-            embedding_file=BASE_DIR / "data" / "vector_db" / "rag_embeddings_v3.json"
+        # 제도 트랙: 팀원 이식본. HCX 호출 0회로 조회하는 SQL과, BM25+벡터
+        # RRF로 검색하는 RAG.
+        self.institution_sql = InstitutionSQLAgent(
+            db_path=BASE_DIR / "data" / "pension_rules.db"
         )
+        self.institution_rag = InstitutionRAGAgent(
+            embedding_file=BASE_DIR / "data" / "vector_db" / "junil_rag_embeddings_v3.json"
+        )
+        # 상품(펀드) 트랙: 기존 Text-to-SQL. financial_data.sqlite(제도)는 더 이상
+        # 쓰지 않지만 fund_prospectus_v2.sqlite는 그대로 쓴다.
         self.sql_agent = PensionSQLAgent(
             fin_db_path=BASE_DIR / "data" / "financial_data.sqlite",
             fund_db_path=BASE_DIR / "data" / "fund_prospectus_v2.sqlite"
@@ -34,6 +57,8 @@ class PensionOrchestrator:
         has_fin = any(w in q for w in self.FIN_WORDS)
         has_cmp = any(w in q for w in self.COMPARE_WORDS)
         has_adv = any(w in q for w in self.ADVICE_WORDS)
+        if CLASS_CODE_RE.search(query):
+            has_fund = True   # 클래스 코드가 보이면 펀드 신호로 취급
 
         if has_fund and has_adv:
             return "HYBRID"          # 상품 추천은 제도 근거도 함께 필요
@@ -66,7 +91,7 @@ class PensionOrchestrator:
             "temperature": 0.0
         }
         try:
-            res = requests.post(HCX_URL, headers=build_headers(), json=payload, timeout=TIMEOUT).json()
+            res = post_with_retry(HCX_URL, payload).json()
             content = res.get("result", {}).get("message", {}).get("content", "").strip()
             if content.startswith("```"):
                 content = content.replace("```json", "").replace("```", "").strip()
@@ -84,6 +109,13 @@ class PensionOrchestrator:
 따라서 확인이 필요한 조건이 있으면 그 확인 질문을 첫 답변 안에 포함하고,
 동시에 조건별 결론까지 한 번에 제시한다.
 
+[우선순위 - 아래 두 규칙이 충돌하면 이 규칙이 이긴다]
+근거가 질문의 주제를 아예 다루지 않으면(코퍼스에 없는 질문), "확인 필요 조건 ->
+조건별 결론" 구성을 적용하지 않는다. 그 경우엔 "근거가 주제를 안 다루면 만들지
+않는다" 규칙만 따라 "제공된 자료에서는 OO에 대한 내용을 확인하지 못했습니다."
+로 짧게 답한다. 조건 하나가 빠진 것(예: 계좌 종류 미기재)과 근거 자체가 없는
+것(질문 주제를 다루는 근거가 전혀 없음)을 구분해서 판단한다.
+
 [답변 구성 - 이 순서를 지킨다]
 1) 확인 필요 조건
    질의에 조건(계좌 종류, 소득 구간, 연령, 투자기간, 감내 위험 등)이 빠져 있으면
@@ -94,8 +126,60 @@ class PensionOrchestrator:
 3) 근거
    금액, 세율, 한도, 보수율, 위험등급, 수익률은 근거에 적힌 값을 변형 없이 인용한다.
    제도 근거와 DB 조회 수치를 함께 제시해 어디서 나온 값인지 드러낸다.
+   조회 결과에 class_meaning 컬럼이 있으면(연금저축/퇴직연금, 온라인/오프라인
+   구분) 그 뜻을 답변에 반드시 그대로 옮겨 적는다 — class_name 코드만 나열하고
+   의미를 안 옮기면 답변이 틀린 것으로 간주된다.
+   [연금수령한도 계산] 블록처럼 산식과 결과가 함께 주어진 근거는 결과 금액만
+   쓰지 말고 산식에 쓰인 비율(예: 120%)과 대입 과정도 함께 인용한다.
 4) 다음 행동
    사용자가 이어서 확인하거나 결정할 일을 한 줄로 제시한다.
+
+[규칙 - 수치와 조건은 절대 요약하지 않는다]  ★ 가장 중요
+근거에 수치나 조건이 여러 개 나열되어 있거나 경우에 따라 다르게 제시되어 있으면,
+임의로 하나만 고르거나 뭉뚱그리지 말고 전부 다 적는다.
+아래 항목은 하나도 빠뜨리지 않는다.
+  - 금액.비율.세율   (900만원, 1,800만원, 16.5%, 13.2%, 4.4% ...)
+  - 기한.기간        (60일 이내, 6개월 이상, 14일 이내, 6주, 5년 경과 ...)
+  - 조건.자격        (무주택자, 만 55세 이상, 계속근로기간 1년 이상, 주 15시간 ...)
+  - 절차.방법        (내점 신청, 신청서 제출, 근로자대표 동의, 고용노동부 신고 ...)
+  - 예외.단서        ("단, ~인 경우는 제외" 같은 문구)
+요약하느라 이 항목을 생략하면 답변이 틀린 것으로 간주된다.
+근거에 두 가지 경우가 나오면 둘 다 쓴다. 길이 제한은 없다.
+
+[규칙 - SQL 조회 결과를 임의로 잘라내지 않는다]
+정형 DB 조회 결과가 여러 행이면 질문이 요구한 범위 안의 행을 전부 제시한다.
+"총 N개 중 일부 발췌" 처럼 임의로 줄이지 않는다. 표로 정리하면 읽기 좋다.
+
+[규칙 - 근거가 주제를 안 다루면 만들지 않는다]
+검색 근거가 질문의 주제를 직접 다루지 않으면 아는 것처럼 답을 구성하지 않는다.
+  1. 근거에 없는 절차.기한.연락처.URL.기관명.법령 조문을 만들어내지 않는다.
+  2. 실제로 그 내용을 담고 있지 않은 근거 번호를 인용하지 않는다.
+  3. "일반적으로", "대부분의 기관에서는", "통상" 으로 시작하는 일반론으로
+     근거의 빈자리를 메우지 않는다.
+근거가 주제를 다루지 않으면 "제공된 자료에서는 OO에 대한 내용을 확인하지
+못했습니다." 로만 답하고, 확인 가능한 인접 정보가 있으면 그것만 덧붙인다.
+
+[규칙 - 주제가 같아도 질문의 구체적 조합까지 다루는지 확인한다]  ★ 환각 방지
+근거가 질문과 "같은 주제"를 다루더라도, 질문이 묻는 "구체적인 상황·조건의
+조합"을 그 근거 문단이 실제로 명시하는지 따로 확인한다. 일반 규정 하나를
+근거로 삼아 질문에 나온 특수한 조합(예: "A가 취소된 뒤 B를 안 하면?", "C가
+반송되면?")까지 자동으로 답이 된다고 넘겨짚지 않는다.
+  예) 근거에 "사전지정운용방법 자동 이전" 일반 규정만 있고 "승인취소 이후
+      가입자가 별도 지시를 안 한 경우"라는 조합은 안 나온다 -> 이 조합에는
+      "제공된 자료에서는 확인하지 못했습니다"로 답한다. 일반 규정을 끌어와
+      단정하지 않는다.
+[근거 N]처럼 근거 번호를 인용할 때는, 그 번호의 근거 문단에 실제로 그 내용을
+담은 문장이 있는지 다시 확인한 뒤에만 인용한다. 문단에 없는 절차·URL·기관명을
+그 번호의 이름으로 말하지 않는다 — 없는 근거를 인용하는 것은 이 시스템에서
+가장 심각하게 감점되는 행동이다.
+질문이 요구하는 정확한 조건(취소·반송·특정 회원가입 절차 등)이 근거 문단에
+문자 그대로 등장하지 않으면, 아무리 그럴듯해도 만들어 답하지 않는다.
+
+[출력 형식 주의]
+용어나 수치 중간에 ** 를 넣지 않는다. 강조는 항목 이름이나 줄머리에만 쓴다.
+용어와 조사 사이에 ** 가 끼면 문자열이 끊어져 채점.검색에서 불이익이 있다.
+  (X) 자금을 **금융기관**에 적립하고      (O) 자금을 금융기관에 적립하고
+  (X) 이전하는 것은 **불가능**합니다      (O) 이전하는 것은 불가능합니다
 
 [원칙]
 - 질문에 사실과 다른 전제가 섞여 있으면 먼저 바로잡고 답한다.
@@ -146,7 +230,14 @@ class PensionOrchestrator:
             "temperature": 0.1,
             "maxCompletionTokens": 1500
         }
-        res = requests.post(HCX_URL, headers=build_headers(), json=payload, timeout=TIMEOUT).json()
+        response = post_with_retry(HCX_URL, payload)
+        if response.status_code != 200:
+            # generate_answer() 는 이미 이 체크가 있는데 여기만 빠져 있었다.
+            # 체크 없이 .json() 을 호출하면 오류 응답 바디가 JSON 이 아닐 때
+            # 원인을 알 수 없는 예외가 나고, main.py 가 통째로 삼켜서
+            # "답변 생성 중 오류가 발생했습니다"만 남는다(Q-038).
+            raise RuntimeError(f"HCX 오류 {response.status_code}: {response.text[:1000]}")
+        res = response.json()
         return res.get("result", {}).get("message", {}).get("content", "").strip()
 
     def process(self, query: str) -> dict:
@@ -158,35 +249,86 @@ class PensionOrchestrator:
         retrieved_sources = []
 
         # 1. SQL 실행
+        # HYBRID 는 원래 DB 를 하나만 골랐다. "세액공제 받으면서 넣을 저보수 연금펀드"
+        # 처럼 양쪽이 다 필요한 질의에서 한쪽 수치가 통째로 빠졌다.
+        # 신호가 둘 다 있으면 둘 다 조회한다.
         if route in ["SQL_FIN", "SQL_FUND", "HYBRID"]:
-            db_type = "FIN" if route == "SQL_FIN" else "FUND"
-            if route == "HYBRID":
-                db_type = "FUND" if any(k in query for k in ["펀드", "상품", "보수", "등급", "추천"]) else "FIN"
+            if route == "SQL_FIN":
+                db_types = ["FIN"]
+            elif route == "SQL_FUND":
+                db_types = ["FUND"]
+            else:
+                _q = query.lower()
+                want_fund = any(w in _q for w in self.FUND_WORDS)
+                want_fin = any(w in _q for w in self.FIN_WORDS)
+                db_types = [t for t, w in (("FUND", want_fund), ("FIN", want_fin)) if w]
+                if not db_types:
+                    db_types = ["FIN"]
             
-            sql_res = self.sql_agent.generate_and_execute(query, db_type)
-            sql_context = json.dumps(sql_res, ensure_ascii=False)
-            think_trace_list.append(f"2. 정형 DB 조회 완료 (SQL: {sql_res.get('sql', 'N/A')})")
-            retrieved_sources.append({"source_file": f"{db_type.lower()}_data.sqlite"})
+            sql_parts = []
+            for db_type in db_types:
+                if db_type == "FIN":
+                    # 제도 SQL — 팀원 이식본. Text-to-SQL이 아니라 결정적 슬롯
+                    # 조회 + 3치 조건 판정이라 SQL 생성 실패라는 실패 모드 자체가 없다.
+                    fin_text, fin_trace = run_institution_sql(self.institution_sql, query)
+                    if fin_text:
+                        sql_parts.append(fin_text)
+                    think_trace_list.append(
+                        "2. 제도 정형 DB 조회 완료 [FIN] (결정적 슬롯 조회, HCX 호출 0회)")
+                    think_trace_list.extend(f"   · {t}" for t in fin_trace)
+                    retrieved_sources.append({"source_file": "pension_rules.db"})
+                else:
+                    sql_res = self.sql_agent.generate_and_execute(query, db_type)
+                    sql_parts.append(json.dumps(sql_res, ensure_ascii=False))
+                    think_trace_list.append(
+                        f"2. 정형 DB 조회 완료 [{db_type}] (SQL: {sql_res.get('sql', 'N/A')})")
+                    retrieved_sources.append({"source_file": f"{db_type.lower()}_data.sqlite"})
+            sql_context = "\n\n".join(p for p in sql_parts if p)
 
-        # 2. RAG 실행
+            # 펀드 100종의 본문 텍스트 컬럼(fund_profiles/fund_sections)이
+            # LIKE 검색에 걸리면 결과가 커져 HCX 요청이 크기 제한에 걸릴 수
+            # 있다(Q-038 추정 원인). 방어적으로 앞부분만 쓴다.
+            MAX_SQL_CONTEXT_CHARS = 6000
+            if len(sql_context) > MAX_SQL_CONTEXT_CHARS:
+                think_trace_list.append(
+                    f"2-1. SQL 조회 결과가 커서 앞부분만 사용 (원본 {len(sql_context)}자)")
+                sql_context = sql_context[:MAX_SQL_CONTEXT_CHARS] + "\n...(생략)"
+
+        # 2. RAG 실행 — 팀원 이식본. 벡터+메타보너스 대신 BM25+벡터 RRF 융합.
+        # (institution_rag_agent는 검색 전담이라 자체 답변을 만들지 않는다 —
+        #  최종 답변은 항상 아래 3번 synthesize_answer가 만든다.)
         if route in ["RAG", "HYBRID", "SQL_FIN"]:   # 제도·세제는 문서 근거를 함께 본다
-            rag_res = self.rag_agent.ask(query, generate=(route == "RAG"))
-            rag_context = rag_res.get("raw_context", "")
-            for s in rag_res.get("sources", []):
-                retrieved_sources.append(s)
-            think_trace_list.append(f"3. 제도 문서 RAG 검색 완료 ({len(rag_res.get('sources', []))}건 인용)")
-            if rag_res.get("clarifications"):
-                think_trace_list.append("3-1. 확인 필요 조건 식별: " + ", ".join(rag_res["clarifications"]))
-            if rag_res.get("assumptions"):
-                think_trace_list.append("3-2. 답변에 사용한 가정: " + ", ".join(rag_res["assumptions"]))
+            rag_result = self.institution_rag.run(query, top_k=6)
+            rag_evidence = rag_result.get("evidence") or []
+            rag_context = format_institution_rag_context(rag_evidence)
+            for e in rag_evidence:
+                p = e.get("provenance") or {}
+                if p.get("source_file"):
+                    retrieved_sources.append({
+                        "source_file": p.get("source_file"),
+                        "page": p.get("page"),
+                        "locator": p.get("locator"),
+                    })
+            think_trace_list.append(
+                f"3. 제도 문서 RAG 검색 완료 (BM25+벡터 RRF, {len(rag_evidence)}건 인용)")
+            think_trace_list.extend(f"   · {t}" for t in rag_result.get("think_trace") or [])
 
-        # 3. 답변 생성
-        if route == "RAG" and rag_res.get("answer"):
-            final_answer = rag_res.get("answer")
-            think_trace_list.append("4. RAG 기반 직접 답변 완료 (단일턴 전제: 확인 조건을 답변에 포함)")
-        else:
-            final_answer = self.synthesize_answer(query, rag_context, sql_context)
-            think_trace_list.append("4. 정형/비정형 통합 분석 완료 (단일턴 전제: 확인 조건을 답변에 포함하고 조건별 분기 결론 제시)")
+        # 2-b. 정해진 공식이 있는 계산은 LLM 에게 시키지 않는다.
+        # HCX 가 x120% 를 x(11-연차) 로 잘못 적용해 8배 틀린 값을 내는 사례가 있다.
+        calc_text = pension_calc.compute(query)
+        if calc_text:
+            sql_context = (calc_text + "\n\n" + sql_context).strip()
+            think_trace_list.append(
+                "3-3. 연금수령한도를 코드로 직접 계산 (LLM 산수 오류 회피)")
+
+        # 3. 답변 생성 — 항상 통합 생성(synthesize_answer) 하나로 만든다.
+        # 이전에는 RAG 단독 경로가 rag_agent.generate_answer()라는 별도의(더 단순한)
+        # 프롬프트로 직접 답을 만들었다. institution_rag_agent는 검색만 전담하므로
+        # 이제 모든 경로가 이 파일의 synthesize_answer (절대금지 규칙 포함, 더 엄격한
+        # 프롬프트) 하나로 통일된다 — 두 프롬프트 간 답변 스타일 불일치도 함께 없어진다.
+        final_answer = self.synthesize_answer(query, rag_context, sql_context)
+        think_trace_list.append(
+            "4. 정형/비정형 통합 분석 완료 (단일턴 전제: 확인 조건을 답변에 포함하고 조건별 분기 결론 제시)")
 
         return {
             "answer": final_answer,
