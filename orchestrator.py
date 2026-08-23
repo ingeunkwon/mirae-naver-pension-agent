@@ -354,6 +354,7 @@ class PensionOrchestrator:
         rag_context = ""
         sql_context = ""
         retrieved_sources = []
+        core_facts = []   # response_validator.py의 L3(목표 충족) 검증에 넘길 상위 근거
 
         # 1. SQL 실행
         # HYBRID 는 원래 DB 를 하나만 골랐다. "세액공제 받으면서 넣을 저보수 연금펀드"
@@ -433,6 +434,11 @@ class PensionOrchestrator:
                             retrieved_sources.append({"source_file": f.get("source_file")})
                 think_trace_list.append(
                     f"3-1. 정형 사실 키워드 검색 완료 (pension_facts, {len(facts)}건)")
+                # BM25 상위 2건만 "핵심"으로 취급한다. 3건으로 해봤더니(Q-029로
+                # 직접 확인) 실제로 필요한 사실(60일)은 잡히지만 3위 항목은 질문과
+                # 약하게만 관련된 경우가 섞여 답변 끝에 불필요한 사족이 붙었다.
+                # 2건이면 노이즈를 줄이면서도 Q-029 사례(60일이 2위)는 여전히 잡힌다.
+                core_facts.extend(facts[:2])
 
         # 2-a. 펀드(상품) 절차형 질문 — 상품설명서 RAG (SQL_FUND_RAG 전용).
         if route == "SQL_FUND_RAG":
@@ -475,5 +481,9 @@ class PensionOrchestrator:
             "answer": final_answer,
             "think_trace": " -> ".join(think_trace_list),
             "retrieved_context": f"{rag_context}\n{sql_context}".strip(),
-            "sources": retrieved_sources
+            "sources": retrieved_sources,
+            # main.py가 response_validator.validate_response()에 그대로 넘긴다.
+            # API 응답 payload(question_id/question/retrieved_context/think_trace/
+            # answer/sources — "전부 문자열" 계약)에는 안 들어간다, 검증 단계 내부용.
+            "core_facts": core_facts,
         }

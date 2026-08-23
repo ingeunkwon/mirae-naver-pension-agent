@@ -57,6 +57,7 @@ def get_answer(
     question: str = Query(..., description="평가 질의 원문")
 ):
     t0 = time.monotonic()
+    result: dict = {}   # except 분기에서도 정의돼 있어야 밑의 core_facts 조회가 안전하다
     try:
         result = orchestrator.process(question)
         answer = str(result.get("answer") or "")
@@ -87,13 +88,13 @@ def get_answer(
             "sources": "",
         }
 
-    # L0(형식 검사, 비어있으면 채움) -> L2(답변 속 수치가 근거에서 확인되는지
-    # 대조) 를 순수 파이썬으로 돌린다. 답변 내용 자체는 바꾸지 않고(이미
-    # 튜닝된 답변이 깨질 위험), 검증 로그만 think_trace 뒤에 붙여 평가자가
-    # 검증 과정을 볼 수 있게 한다. L0이 answer를 못 채운 경우에 한해서만
-    # answer가 바뀐다(빈 답변 -> 기본 안내 문구, main.py가 이미 하던 동작을
-    # 한곳에 모은 것).
-    payload, _validation_log = validate_response(payload)
+    # L0(형식 검사, 비어있으면 채움) -> L3(답변에 반영 안 된 핵심 근거 보강,
+    # fact_search 상위 3건에 한해 좁게) -> L2(답변 속 수치가 근거에서 확인되는지
+    # 대조, 로그만) 를 순수 파이썬으로 돌린다. L3만 answer를 바꿀 수 있고
+    # (근거는 이미 찾았는데 LLM이 문장에 안 넣은 경우를 보강), 나머지는
+    # think_trace 뒤에 로그만 남긴다. core_facts는 API 응답 payload에는
+    # 없는 값이라 result에서 따로 꺼내 넘긴다.
+    payload, _validation_log = validate_response(payload, result.get("core_facts"))
 
     elapsed = time.monotonic() - t0
     print(f"[server] {question_id} {elapsed:.1f}초", file=sys.stderr)
