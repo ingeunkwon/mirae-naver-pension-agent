@@ -62,8 +62,14 @@ HCX가 계수를 잘못 적용해 값이 8배 틀리는 사례가 반복 보고�
       |  + 3치 조건판정) |                        |
       +------------------+              fund_prospectus_v2.sqlite
       | InstitutionRAG   |                  (펀드 100종)
-      |  Agent           |
-      | (BM25+벡터 RRF)  |
+      |  Agent           |                        |
+      | (BM25+벡터 RRF,  |              [SQL_FUND_RAG 라우팅 시]
+      |  주제/속성 태깅) |              PensionRAGAgent.ask(생성 없이
+      +------------------+               검색만) — 환매·해지 등 절차성
+      | FactSearchIndex  |               질문에 상품설명서 문단 보강
+      | (pension_facts   |
+      |  BM25 직접 조회, |
+      |  RAG 랭킹과 무관)|
       +------------------+
                 |
       pension_rules.db +
@@ -76,6 +82,9 @@ HCX가 계수를 잘못 적용해 값이 8배 틀리는 사례가 반복 보고�
                         코드로 직접 계산 (pension_calc.py)
                                  |
                     (3) HCX-007 통합 답변 생성 (synthesize_answer)
+                                 |
+                    (4) response_validator — L0(형식) -> L3(FactSearch
+                        상위 근거가 답변 문장에 빠졌으면 보강) -> L2(로그)
                                  |
         { question_id, question, retrieved_context,
           think_trace, answer }
@@ -126,6 +135,38 @@ hybrid_score = cosine_similarity(query, chunk)
 깔끔하게 거를 수 없었습니다(`separated: false`). 그래서 임계값 대신 프롬프트 규칙
 쪽에 더 투자했습니다 — 8장 참고.
 
+### 정형 사실 직접 검색 (FactSearchIndex) + L3 목표 충족 검증
+
+제도 트랙은 위 BM25+벡터 RRF 검색 외에, `pension_facts` 226건 전체를 별도로
+BM25 인덱싱해 **RAG 랭킹과 무관하게 키워드로 직접 조회**하는 `fact_search.py`를
+추가로 태웁니다. RAG 임베딩 검색이 상위 청크를 잘 걸러도 특정 사실 하나가
+`top_k` 밖으로 밀리는 경우가 있어, 이 직접 조회가 그 사실을 별도 근거 블록으로
+보강합니다(`KEEP_RATIO=0.25` — institution_rag의 0.35보다 느슨하게 잡아, 이건
+"주 근거"가 아니라 "보조 근거"라는 성격에 맞췄습니다).
+
+여기서 찾은 상위 근거는 `core_facts`로 표시해 `response_validator.py`의
+**L3(목표 충족) 검증**에 그대로 넘깁니다. 공모전 요구사항의 검증 명세(L0 형식 /
+L1 정책 / L2 팩트대조 / L3 목표충족)에서 L3는 "질문이 요구한 모든 조건에
+답변이 실제로 응답했는가"를 뜻하는데, 반복 관찰된 실패 패턴 — **근거는 매번
+정확히 찾았는데(`context_ok=True` 고정) LLM이 답변 문장을 쓸 때 그 안의 숫자·
+문구를 빠뜨리는 경우**(예: "60일"이 근거에는 있는데 답변 문장에는 없음, temperature
+0.1에서도 실행마다 이 부분만 갈림) — 를 정확히 겨냥합니다. `augment_missing_core_facts()`가
+답변 텍스트를 정규화해 core_facts의 숫자+단위 토큰(%, 만원, 세, 년차 등)이
+이미 들어 있는지 확인하고, 빠진 항목만 답변 끝에 `[추가 확인 사항]` 블록으로
+덧붙입니다. L0/L3만 `answer`를 바꿀 수 있고 L2는 로그만 남깁니다(이미 튜닝된
+답변을 L2가 임의로 재작성하지 않는다는 기존 원칙 유지).
+
+라우팅(`orchestrator.route_query`)에도 두 가지를 추가했습니다.
+
+- **`TRANSFER_WORDS`**(실물이전/이관/갈아타기 등)가 있으면 상품 키워드가 같이
+  있어도 `SQL_FUND`가 아니라 `HYBRID`로 보냅니다. "실물이전으로 옮길 수 없는
+  상품" 같은 질문이 상품명 때문에 곧장 Text-to-SQL로 빠지면서 제도 RAG를
+  아예 안 타던 것이 원인이었습니다 — 10장 "알려진 한계"의 기존 항목이 이 수정으로
+  해소됐습니다.
+- **`FUND_PROCEDURE_WORDS`**(환매/해지/신청/서류 등 절차성 질문)는 새 라우트
+  `SQL_FUND_RAG`로 보내, Text-to-SQL 결과에 `PensionRAGAgent`의 상품설명서
+  RAG 검색(생성 없이 검색만)을 더해 절차 설명 문단을 함께 근거로 씁니다.
+
 ---
 
 ## 3. 프로젝트 구조
@@ -134,13 +175,16 @@ hybrid_score = cosine_similarity(query, chunk)
 .
 ├── main.py                     FastAPI 엔트리포인트 (공식 평가 스키마)
 ├── orchestrator.py             라우팅 -> 제도/상품 조회 -> 통합 생성
+├── response_validator.py       응답 후처리 L0(형식)/L3(핵심 사실 누락 보강)/L2(팩트 대조 로그)
 ├── sql_agent.py                펀드 Text-to-SQL 생성·실행 (클래스 필터 안전장치 포함)
 ├── rag_agent.py                펀드 임베딩 · 하이브리드 검색 · 리랭킹 · 공용 HTTP 유틸
 ├── pension_calc.py             연금수령한도 코드 계산 (LLM 산수 회피)
 │
 ├── institution_sql_agent.py    제도 결정적 슬롯 조회 + 3치 조건판정 (팀원 이식)
-├── institution_rag_agent.py    제도 BM25+벡터 RRF 검색 (팀원 이식)
+├── institution_rag_agent.py    제도 BM25+벡터 RRF 검색 (팀원 이식, 주제/속성 태깅 확장)
 ├── institution_format.py       위 두 결과를 synthesize_answer용 텍스트로 직렬화
+├── fact_search.py              제도 정형 사실(pension_facts) BM25 직접 검색 — RAG 랭킹과
+│                                무관하게 키워드로 근거를 보강 (L3 검증의 근거 소스)
 ├── tri.py                      3치 논리 (MET/UNMET/UNKNOWN) — 팀원 원본
 ├── safe_eval.py                수식 안전 계산 (AST 기반, eval() 미사용) — 팀원 원본
 ├── bm25.py                     BM25 랭킹 — 팀원 원본
@@ -161,6 +205,9 @@ hybrid_score = cosine_similarity(query, chunk)
 │
 ├── evaluate.py                 evaluation_set.json(자체 10문항) 채점 러너
 ├── eval_answers.py             evalset_v1/v2.json(팀원 제공 40+26문항) 채점 러너
+├── eval_adapter.py             eval_answers.py --adapter 용 래퍼 — main.py와 동일하게
+│                                response_validator를 거친 뒤 채점(로컬 점수=실제 제출 점수)
+├── compare_results.py          eval_answers.py --out 결과 두 개를 비교해 회귀 여부 진단
 ├── evalset_v1.json             팀원 제공 평가셋 v1 — 팀원 코퍼스 기준, 6라운드 튜닝됨(홈그라운드)
 ├── evalset_v2.json             팀원 제공 평가셋 v2 — "팀에서 받은 질문", 상대적으로 홀드아웃
 ├── evaluation_set.json         자체 평가 질의셋 (공식 참고질의 기반, 10문항)
@@ -172,6 +219,7 @@ hybrid_score = cosine_similarity(query, chunk)
 ├── calibrate2.py                calibrate_threshold.py 2차 재측정
 ├── diag_hanwha.py               fund_prospectus_v2.sqlite 클래스 코드 체계 진단 도구
 ├── diag_q017.py                 /answer 응답의 실제 SQL·에러 원문을 직접 확인하는 도구
+├── diag_missing.py              "근거 누락" 의심 문항이 실제로 pension_facts에 있는지 확인
 │
 ├── apply_fixes.py               2026-08-20 1차 개선 패치 (--revert 로 되돌리기 가능)
 ├── apply_fixes2.py              2026-08-20 2차 회귀수정 패치 (--revert 로 되돌리기 가능)
@@ -298,11 +346,26 @@ python evaluate.py                # 전체
 python evaluate.py --id OF-002    # 특정 문항만
 ```
 
-팀원 제공 평가셋(v1 40문항 / v2 26문항) 채점 — 문자열 매칭 기반 1차 채점입니다.
+팀원 제공 평가셋(v1 40문항 / v2 22문항) 채점 — 문자열 매칭 기반 1차 채점입니다.
 
 ```bash
 python eval_answers.py --endpoint http://127.0.0.1:8000/answer \
     --evalset evalset_v1.json --out result_v1.json --show
+```
+
+서버를 안 띄우고 같은 프로세스에서 더 빠르게 돌리려면 `--adapter`를 씁니다.
+`eval_adapter.py`는 `main.py`와 동일하게 `response_validator.validate_response()`(L0/L3/L2)를
+거친 뒤 반환하므로, 이 방식의 로컬 점수가 곧 실제 제출 시 받을 점수입니다.
+
+```bash
+python eval_answers.py --adapter eval_adapter:answer \
+    --evalset evalset_v1.json --out result_v1.json --show
+```
+
+두 결과 파일을 비교해 회귀 여부를 바로 확인하려면:
+
+```bash
+python compare_results.py result_v1_이전.json result_v1_이후.json
 ```
 
 환각 점검(적대적 질문 6개, 지금 코퍼스 기준으로 실제 무근거임을 직접 확인한 문항):
@@ -321,9 +384,12 @@ python check_hallu2.py
 
 ### 현재 결과 (2026-08-22 기준, 참고용)
 
-| | v1 (40문항) | v2 (26문항) | 환각 점검 (check_hallu2, 6문항) |
+| | v1 (40문항) | v2 (22문항) | 환각 점검 (check_hallu2, 6문항) |
 |---|---|---|---|
-| 정답 포함률 | 72.5% (29/40) | 81.8% (18/22) | 6/6 (근거 없이 단정한 문항 0건) |
+| 정답 포함률 | **80.0% (32/40)** | **90.9% (20/22)** | 6/6 (근거 없이 단정한 문항 0건) |
+
+(2026-08-22 초반 수치는 각각 72.5%/81.8%였습니다 — 8장 "제도 검색 근거 보강 + L3 목표
+충족 검증" 항목의 변경으로 최종 위 수치까지 올라갔습니다.)
 
 **이 숫자를 그대로 실력 지표로 보면 안 됩니다.** 아래 사정이 있습니다.
 
@@ -332,6 +398,10 @@ python check_hallu2.py
 - **같은 코드로 재실행해도 점수가 흔들립니다.** `temperature=0.1`이어도 LLM 생성 표현이
   매번 조금씩 바뀌고, 채점기는 정확한 문자열만 보기 때문에 몇 문항은 매 실행 뒤집힙니다.
   단발 점수보다 **결정적 버그(크래시·라우팅 비결정성)가 고쳐졌는지**를 우선 보십시오.
+  실제로 8장의 세 라운드 수정 과정에서 매번 몇 문항씩 뒤집혔는데, `retrieved_context`를
+  직접 대조해 보면 근거 검색 자체는(`context_ok`) 매 실행 동일하고, 답변 문장에 그 근거의
+  정확한 숫자·문구가 포함되는지만 매번 갈렸습니다(예: Q-029 "60일"). 이 재현 가능한 패턴이
+  아래 L3 검증 계층을 만든 직접적인 계기입니다.
 - 몇몇 "오답"은 실제로는 시스템이 평가셋의 정답 키보다 더 정확한 값을 찾은 경우입니다
   (예: Q-014 — 평가 키는 NH-Amundi 0.15%인데 시스템은 DB에서 더 싼 유진챔피언 0.1423%를
   찾아 정답 처리를 못 받음). 평가 키 자체가 데이터 재구축 이후 낡았을 가능성이 있습니다.
@@ -475,6 +545,28 @@ RRF 검색)으로 전면 교체. 펀드 트랙과 `synthesize_answer` 프롬프�
   추가. `check_hallu2.py`의 적대적 질문 6개(2개는 "실제 있는 주제 + 없는 디테일" 조합형)로
   검증 — 근거 없이 단정한 사례 0건
 
+**2026-08-22 제도 검색 근거 보강 + 라우팅 수정** — v1 72.5%→70.0%(재측정 시점 잡음
+포함), v2 81.8%→77.3%. `institution_rag_agent.py`의 태그 없는 질문 fallback이
+`pension_types`만 채우고 `topics`/`aspects`는 항상 비워둬서, 정당한 제도 질문 다수가
+`search()`의 `n_meta==0` 분기로 빠지며 `top_k`가 2로 축소되던 문제를 발견 — `rag_agent.py`의
+검증된 주제/속성 키워드 목록을 이식해 해소. 신규 `fact_search.py`로 `pension_facts` 226건을
+BM25 직접 조회하는 보조 근거 경로 추가. 라우팅에 `TRANSFER_WORDS`(실물이전 등 — 상품
+키워드가 같이 있어도 `HYBRID`로 보냄, 기존 10장의 "실물이전 미해결" 항목의 근본 원인)와
+`FUND_PROCEDURE_WORDS`(환매·해지 등 절차 질문 → 신규 `SQL_FUND_RAG` 라우트, 펀드 SQL 결과에
+상품설명서 RAG 검색을 보강) 추가. 2장 "정형 사실 직접 검색" 절 참고.
+
+**2026-08-22 LaTeX 이스케이프 버그 수정** — `synthesize_answer` 프롬프트에만 없던 "LaTeX
+표기 금지" 규칙(`rag_agent.generate_answer`에는 이미 있던 규칙)을 이식. HCX가 이따금
+"120%"를 `"120\%"`로 렌더링해 문자열 채점을 깨뜨리던 문제(Q-030에서 발견) 해결.
+
+**2026-08-22 L3(목표 충족) 검증 계층 추가 — 최종 반영, v1 80.0%(32/40)/v2 90.9%(20/22)**.
+`response_validator.py`에 `augment_missing_core_facts()`를 추가해 공식 검증 명세의 L0/L1/L2/L3
+중 마지막까지 구현 완료. `fact_search.py`가 찾은 상위 근거(core_facts)의 숫자+단위 토큰이
+답변 문장에 빠져 있으면 `[추가 확인 사항]` 블록으로 보강 — "근거는 찾았는데 LLM 문장에서
+빠지는" 반복 관찰된 실패 패턴(2·5장 참고)을 직접 겨냥. `eval_adapter.py`도 `main.py`와
+동일하게 `validate_response()`를 거치도록 다시 작성해 로컬 평가 점수와 실제 제출 점수가
+어긋나지 않게 맞췄습니다. `compare_results.py`로 매 변경 후 회귀 여부를 문항 단위로 검증.
+
 ---
 
 ## 9. 기술 스택
@@ -484,8 +576,9 @@ RRF 검색)으로 전면 교체. 펀드 트랙과 `synthesize_answer` 프롬프�
 | LLM | CLOVA Studio HyperCLOVA X (HCX-007) |
 | 임베딩 | CLOVA Studio Embedding v2 (1024차원) |
 | 리랭킹 | CLOVA Studio Reranker |
-| 제도 검색 | BM25 + 벡터 코사인, Reciprocal Rank Fusion |
+| 제도 검색 | BM25 + 벡터 코사인, Reciprocal Rank Fusion + `pension_facts` BM25 직접 조회 |
 | 제도 조건 판정 | 3치 논리(MET/UNMET/UNKNOWN), AST 기반 안전 수식 계산 |
+| 응답 후처리 | L0(형식) / L3(목표 충족 보강) / L2(팩트 대조 로그) — `response_validator.py` |
 | API 서버 | FastAPI + Uvicorn |
 | 데이터 저장 | SQLite |
 | 벡터 검색 | NumPy 코사인 유사도 (인메모리) |
@@ -500,9 +593,11 @@ RRF 검색)으로 전면 교체. 펀드 트랙과 `synthesize_answer` 프롬프�
   상품은 "연금저축/퇴직연금 전용 클래스" 필터로 걸러지지 않습니다(`diag_hanwha.py`로 확인).
   근본 해결에는 `class_desc`를 대체할 신뢰 가능한 계좌유형 컬럼이 필요한데 현재 스키마에는
   없습니다.
-- **실물이전(펀드 명의만 이전) 관련 질문 일부 미해결** — "실물이전으로 옮길 수 없는 상품"
-  (디폴트옵션·리츠) 류 질문은 형태소 분석(예: `실물이전으로`≠`실물이전`) 문제로 팀원 시스템도
-  동일하게 실패한 것으로 확인된 항목입니다. 시간 대비 효과가 낮아 보류했습니다.
+- **L3(목표 충족) 보강은 숫자/단위가 있는 사실에만 동작합니다** — `augment_missing_core_facts()`는
+  `%`/`만원`/`세`/`년차` 같은 패턴이 있는 사실만 "빠졌는지" 판정할 수 있습니다. "비과세",
+  "금융기관에 적립" 처럼 숫자가 없는 문장형 사실이나, `institution_rag` 문서 청크에서만
+  나온 근거(fact_search의 `core_facts`에 안 잡힌 경우)는 이 보강 대상이 아닙니다 — 설계상의
+  범위이지 버그는 아니지만, 이 범위 밖에서는 여전히 5장의 "표현 뒤집힘" 노이즈가 남습니다.
 - **평가 채점 자체의 노이즈** — 문자열 매칭 채점기는 표현이 조금만 달라도 오답 처리합니다.
   같은 코드로 재실행해도 몇 문항은 뒤집힙니다. 5장의 캐비아트를 참고하세요.
 - **운용실적 83/100, 설정·환매 잔고 50/100** — 운용사별 표 형식 차이로 자동 추출이 되지 않는
