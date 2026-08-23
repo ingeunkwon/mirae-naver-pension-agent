@@ -209,7 +209,64 @@ class PensionRAGAgent:
                         ("ISA_연계", r"(?<![A-Za-z])ISA(?![A-Za-z])")]:
             if re.search(pat, query, re.I):
                 pts.append(pt)
-        return {"pension_types": pts, "topics": [], "aspects": []}
+
+        # taxonomy가 없으면(운영 orchestrator.py가 실제로 이렇게 부른다) topics/aspects가
+        # 항상 빈 리스트였다 — 그러면 아래 search()의 n_meta==0 분기가 걸려 "도메인
+        # 사전 매칭 0"으로 판정되고 top_k가 2건까지 줄어든다. rag_agent.py(상품 트랙)의
+        # 검증된 topic/aspect 단어 사전을 이식해 pension_types만이 아니라 topics/aspects도
+        # 채운다 — 임베딩 파일의 primary_topic/knowledge_aspects 라벨과 문자열을 맞춰야
+        # 보너스가 실제로 붙는다 (실측: "이전·전환·승계" 37건, "계약이전" 35건).
+        # 사례: Q-032/033 "다른 증권사로 옮길 때"/"실물이전" — pension_type 패턴에 하나도
+        # 안 걸려 topics/aspects도 항상 비어 있었고, 정답 청크가 top_k=2 밖으로 밀려났다.
+        topics, aspects = [], []
+
+        def _has(*pats):
+            return any(re.search(p, query, re.I) for p in pats)
+
+        if _has(r"중도인출", r"중간인출"):
+            topics.append("중도인출·해지"); aspects.append("중도인출")
+        if _has(r"해지"):
+            topics.append("중도인출·해지"); aspects.append("해지")
+        if _has(r"세액공제", r"공제한도"):
+            topics.append("세금·세액공제·재원확정"); aspects.append("세액공제")
+        if _has(r"퇴직소득세", r"명퇴", r"명예퇴직"):
+            topics.append("세금·세액공제·재원확정"); aspects.append("퇴직소득세")
+        if _has(r"연금소득세", r"세율", r"과세"):
+            topics.append("세금·세액공제·재원확정")
+        if _has(r"납입한도", r"추가납입", r"부담금"):
+            topics.append("부담금·납입"); aspects.append("납입한도")
+        if _has(r"위험자산", r"위험투자"):
+            topics.append("운용·매매"); aspects.append("위험자산")
+        if _has(r"투자한도", r"투자비율", r"몇\s*%", r"몇\s*프로"):
+            topics.append("운용·매매"); aspects.append("투자한도")
+        if _has(r"매수", r"매도", r"리밸런싱"):
+            topics.append("운용·매매")
+        # "실물이전" 자체도 이 목록에 넣는다 — Q-033처럼 이전 동사(옮기다/이전) 없이
+        # "실물이전"이라는 명사만 나오는 질문도 있다.
+        if _has(r"실물이전", r"이전", r"이관", r"옮길", r"옮기", r"금융회사변경", r"증권사.{0,4}옮"):
+            topics.append("이전·전환·승계"); aspects.append("계약이전")
+        if _has(r"계좌이체", r"전환"):
+            topics.append("이전·전환·승계")
+        if _has(r"연금수령", r"연금받", r"수령연차"):
+            topics.append("연금개시·수령"); aspects.append("연금수령")
+        if _has(r"연금개시", r"개시조건"):
+            topics.append("연금개시·수령")
+        if _has(r"압류"):
+            topics.append("권리보호·담보대출·압류"); aspects.append("압류")
+        if _has(r"담보대출"):
+            topics.append("권리보호·담보대출·압류")
+        if _has(r"가입자격", r"가입대상", r"가입조건", r"가입할\s*수", r"가입가능"):
+            topics.append("제도·가입")
+        if _has(r"평균임금", r"급여산정", r"지급종류", r"산정방법"):
+            topics.append("급여·산정")
+        if _has(r"규약", r"교육"):
+            topics.append("규약·교육")
+        if _has(r"신청", r"등록", r"절차", r"서류", r"조회"):
+            topics.append("시스템·업무절차")
+
+        return {"pension_types": pts,
+                "topics": list(dict.fromkeys(topics)),
+                "aspects": list(dict.fromkeys(aspects))}
 
     # ------------------------------------------------------------ 벡터
     def embed_query(self, text: str, budget=None) -> list[float] | None:

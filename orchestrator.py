@@ -14,6 +14,20 @@ from sql_agent import PensionSQLAgent
 from institution_sql_agent import PensionSQLAgent as InstitutionSQLAgent
 from institution_rag_agent import PensionRAGAgent as InstitutionRAGAgent
 from institution_format import run_institution_sql, format_institution_rag_context
+from fact_search import FactSearchIndex, format_fact_evidence
+
+# 상품(펀드) 트랙에 절차형 질문(환매/지급시기 등) 전용 RAG 경로가 구조적으로 없었다
+# (result_v1_fix2.json Q-038). route_query가 FUND_WORDS만 걸리면 무조건 SQL_FUND로
+# 보내 institution_rag도 fund RAG도 전혀 돌지 않았다 — SQL(정형 수치 조회)로는애초에
+# "환매 후 며칠 뒤 지급되는지" 같은 절차 서술이 나올 수 없다. rag_agent.py(원래
+# 상품설명서 RAG, institution 트랙 도입 후 생성에는 안 쓰이던)를 이 경로에만 다시
+# 연결한다. embeddings 파일이 없거나 API 키가 없는 환경에서는 조용히 비활성화된다
+# (rag_agent 모듈은 이미 orchestrator.py 상단에서 import 하고 있어 production에는
+# 키가 있다는 뜻이지만, 로컬/CI처럼 없는 환경도 있을 수 있어 방어적으로 감싼다).
+try:
+    from rag_agent import PensionRAGAgent as FundRAGAgent
+except Exception:
+    FundRAGAgent = None
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -67,6 +81,23 @@ class PensionOrchestrator:
             fund_db_path=BASE_DIR / "data" / "fund_prospectus_v2.sqlite"
         )
 
+        # 정형 사실(pension_facts) 키워드 검색 — institution_rag의 BM25+벡터 랭킹이
+        # 놓친 사실을 보완한다 (fact_search.py 참고, result_v1_fix2.json 재분석 결과).
+        # 226행이라 __init__에서 한 번만 메모리에 올려도 요청마다 재구축할 필요 없다.
+        try:
+            self.fact_search = FactSearchIndex(
+                str(BASE_DIR / "data" / "pension_rules.db"))
+        except Exception:
+            self.fact_search = None
+
+        # 펀드(상품) 트랙 절차형 질문용 RAG — 없으면(임베딩 파일 부재 등) 조용히 비활성화.
+        self.fund_rag = None
+        if FundRAGAgent is not None:
+            try:
+                self.fund_rag = FundRAGAgent()
+            except Exception:
+                self.fund_rag = None
+
     @staticmethod
     def safety_check(question: str) -> str | None:
         """LLM에 닿기 전에 코드가 막는다. None이면 통과."""
@@ -88,6 +119,20 @@ class PensionOrchestrator:
     COMPARE_WORDS = ['이하', '이상', '비교', '차이', '뭐가 달라', '어떤 게', '순위',
                      '가장 낮은', '가장 높은', '저렴']
     ADVICE_WORDS = ['추천', '골라', '좋은', '어떤 상품', '뭐가 좋']
+    # 상품(펀드) 질문인데 "수치 조회"가 아니라 "절차/방법 서술"을 묻는 경우.
+    # 이전에는 FUND_WORDS만 걸리면 무조건 SQL_FUND로 가서 RAG가 전혀 안 돌았다
+    # (Q-038: "환매 신청하면 언제 돈을 받나요?" — SQL_FUND는 계좌/수치 테이블만
+    # 조회하므로 이런 절차 서술은 애초에 SQL로 답이 나올 수 없는 질문이었다).
+    FUND_PROCEDURE_WORDS = ['환매', '매입', '지급시기', '지급 시기', '결제일', '영업일',
+                             '기준가', '신청', '절차', '방법', '서류', '해지', '전환']
+    # "펀드"/"상품"이라는 단어가 섞여 있다고 전부 상품(펀드) 수치 조회는 아니다.
+    # "갖고 있던 펀드를 팔지 않아도 되나요?"(Q-032), "실물이전으로 옮길 수 없는
+    # 상품"(Q-033)은 펀드 자체가 아니라 "퇴직연금 계좌 이전" 이라는 제도 규정을
+    # 묻는 질문인데, FUND_WORDS(펀드/상품)만 보고 SQL_FUND로 보내 institution
+    # RAG/정형사실 검색이 아예 안 돌았다. 이전(移轉) 신호가 있으면 SQL_FUND
+    # 단독이 아니라 HYBRID로 보내 제도 근거도 함께 찾는다.
+    TRANSFER_WORDS = ['실물이전', '이전', '이관', '옮기', '옮길', '갈아타',
+                       '금융회사변경', '금융기관변경', '금융기관 변경']
 
     def route_query(self, query: str) -> str:
         q = query.lower()
@@ -95,19 +140,27 @@ class PensionOrchestrator:
         has_fin = any(w in q for w in self.FIN_WORDS)
         has_cmp = any(w in q for w in self.COMPARE_WORDS)
         has_adv = any(w in q for w in self.ADVICE_WORDS)
+        has_proc = any(w in q for w in self.FUND_PROCEDURE_WORDS)
+        has_transfer = any(w in q for w in self.TRANSFER_WORDS)
         if CLASS_CODE_RE.search(query):
             has_fund = True   # 클래스 코드가 보이면 펀드 신호로 취급
 
         if has_fund and has_adv:
             return "HYBRID"          # 상품 추천은 제도 근거도 함께 필요
+        if has_fund and has_transfer:
+            return "HYBRID"          # 계좌·상품 이전 규정은 제도 근거 없이 SQL_FUND만으론 못 푼다
         if has_fund and (has_cmp or has_fin):
             return "SQL_FUND"        # 수치 비교/필터는 정형 조회
+        if has_fund and has_proc:
+            return "SQL_FUND_RAG"    # 수치 조회 + 상품설명서 RAG 병행 (절차·시점 서술)
         if has_fund:
             return "SQL_FUND"
         if has_fin:
             return "HYBRID"          # 세제 수치는 제도 문서 근거와 함께
         if has_adv:
             return "HYBRID"
+        if has_transfer:
+            return "HYBRID"          # 펀드 신호가 없어도 이전 규정은 제도 근거가 필요
         return self._route_by_llm(query)
 
     def _route_by_llm(self, query: str) -> str:
@@ -301,10 +354,10 @@ class PensionOrchestrator:
         # HYBRID 는 원래 DB 를 하나만 골랐다. "세액공제 받으면서 넣을 저보수 연금펀드"
         # 처럼 양쪽이 다 필요한 질의에서 한쪽 수치가 통째로 빠졌다.
         # 신호가 둘 다 있으면 둘 다 조회한다.
-        if route in ["SQL_FIN", "SQL_FUND", "HYBRID"]:
+        if route in ["SQL_FIN", "SQL_FUND", "SQL_FUND_RAG", "HYBRID"]:
             if route == "SQL_FIN":
                 db_types = ["FIN"]
-            elif route == "SQL_FUND":
+            elif route in ("SQL_FUND", "SQL_FUND_RAG"):
                 db_types = ["FUND"]
             else:
                 _q = query.lower()
@@ -361,6 +414,40 @@ class PensionOrchestrator:
             think_trace_list.append(
                 f"3. 제도 문서 RAG 검색 완료 (BM25+벡터 RRF, {len(rag_evidence)}건 인용)")
             think_trace_list.extend(f"   · {t}" for t in rag_result.get("think_trace") or [])
+
+            # 3-1. 정형 사실(pension_facts) 키워드 검색 — RAG 랭킹이 놓친 사실을 보완한다.
+            # (result_v1_fix2.json 재분석: Q-006/027/032/033/034 전부 정답 문구가
+            #  pension_facts엔 이미 정확히 있었는데 RAG top_k엔 못 들어왔다.)
+            if self.fact_search is not None:
+                facts = self.fact_search.search(query, top_k=10)
+                fact_text = format_fact_evidence(facts)
+                if fact_text:
+                    rag_context = (rag_context + "\n\n" + fact_text).strip() if rag_context else fact_text
+                    for f in facts:
+                        if f.get("source_file"):
+                            retrieved_sources.append({"source_file": f.get("source_file")})
+                think_trace_list.append(
+                    f"3-1. 정형 사실 키워드 검색 완료 (pension_facts, {len(facts)}건)")
+
+        # 2-a. 펀드(상품) 절차형 질문 — 상품설명서 RAG (SQL_FUND_RAG 전용).
+        if route == "SQL_FUND_RAG":
+            if self.fund_rag is not None:
+                fund_result = self.fund_rag.ask(query, generate=False)
+                fund_rag_context = fund_result.get("raw_context", "")
+                if fund_rag_context:
+                    rag_context = (rag_context + "\n\n[상품설명서 RAG 근거]\n" + fund_rag_context).strip() \
+                        if rag_context else "[상품설명서 RAG 근거]\n" + fund_rag_context
+                for s in fund_result.get("sources") or []:
+                    if s.get("source_file"):
+                        retrieved_sources.append({
+                            "source_file": s.get("source_file"),
+                            "page": s.get("page_start"),
+                        })
+                think_trace_list.append(
+                    f"3-2. 펀드 투자설명서 RAG 검색 완료 ({len(fund_result.get('sources') or [])}건 인용)")
+            else:
+                think_trace_list.append(
+                    "3-2. 펀드 투자설명서 RAG 건너뜀 (fund_rag 비활성 — 임베딩 파일 없음)")
 
         # 2-b. 정해진 공식이 있는 계산은 LLM 에게 시키지 않는다.
         # HCX 가 x120% 를 x(11-연차) 로 잘못 적용해 8배 틀린 값을 내는 사례가 있다.
